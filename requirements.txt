@@ -1,0 +1,9 @@
+numpy
+opencv-python-headless
+Pillow
+scipy
+diffusers
+transformers
+accelerate
+safetensors
+faster-whisper

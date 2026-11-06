@@ -1,0 +1,108 @@
+name: Render video (frame by frame, committed to the repo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      story: { description: "Story module in stories/", default: "hospital_clock" }
+      audio: { description: "Voice-over path in the repo", default: "audio/voiceover.mp3" }
+      scale: { description: "0.5 = preview, 1.0 = final 1080x1920", default: "0.5" }
+      regen: { description: "Backgrounds to re-roll (comma list, optional)", default: "" }
+
+permissions:
+  contents: write
+
+env:
+  WORK: work
+  RENDER_BRANCH: renders-${{ inputs.story }}
+  RENDER_DIR: renders/${{ inputs.story }}
+
+jobs:
+  # 1) timing (Whisper) + backgrounds + depth maps + plan.json; resets the render branch
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      shots: ${{ steps.plan.outputs.shots }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: sudo apt-get update -y && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - name: Python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            assets
+          key: assets-${{ inputs.story }}-${{ hashFiles(format('stories/{0}.py', inputs.story)) }}-${{ inputs.regen }}
+      - name: Prep
+        run: |
+          python src/render.py --stage prep --story "${{ inputs.story }}" --audio "${{ inputs.audio }}" \
+            --assets "assets/${{ inputs.story }}" --scale "${{ inputs.scale }}" --work "$WORK" --regen "${{ inputs.regen }}"
+      - id: plan
+        run: echo "shots=$(python -c "import json;print(json.dumps(json.load(open('$WORK/plan.json'))['shots']))")" >> "$GITHUB_OUTPUT"
+      - name: Reset render branch (fresh, history-free)
+        run: bash .github/scripts/reset_branch.sh "$RENDER_BRANCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prep
+          path: |
+            work/plan.json
+            assets/${{ inputs.story }}
+          retention-days: 3
+
+  # 2) one runner per shot: render its frames as images and commit them to the render branch
+  frames:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shot: ${{ fromJSON(needs.prep.outputs.shots) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: requirements-render.txt }
+      - run: pip install -r requirements-render.txt
+      - uses: actions/download-artifact@v4
+        with: { name: prep, path: . }
+      - name: Render frames for this shot
+        run: |
+          python src/render.py --stage frames --shot "${{ matrix.shot }}" --story "${{ inputs.story }}" \
+            --audio "${{ inputs.audio }}" --assets "assets/${{ inputs.story }}" --scale "${{ inputs.scale }}" --work "$WORK"
+      - name: Commit frames to the repo
+        run: |
+          bash .github/scripts/commit_files.sh "$RENDER_BRANCH" work/frames "$RENDER_DIR/frames" "frames - shot ${{ matrix.shot }}"
+
+  # 3) read every frame from the repo, burn captions, mix audio, encode, commit the video
+  assemble:
+    needs: frames
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RENDER_BRANCH }}
+          path: rr
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: requirements-render.txt }
+      - run: sudo apt-get update -y && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - run: pip install -r requirements-render.txt
+      - uses: actions/download-artifact@v4
+        with: { name: prep, path: . }
+      - name: Assemble from the frames stored in the repo
+        run: |
+          python src/render.py --stage assemble --story "${{ inputs.story }}" --audio "${{ inputs.audio }}" \
+            --assets "assets/${{ inputs.story }}" --scale "${{ inputs.scale }}" --work "$WORK" \
+            --frames-dir "rr/$RENDER_DIR/frames" --out "out/${{ inputs.story }}_${{ inputs.scale }}.mp4"
+      - name: Commit the final video to the repo
+        run: |
+          bash .github/scripts/commit_files.sh "$RENDER_BRANCH" out "$RENDER_DIR" "video - ${{ inputs.story }} at scale ${{ inputs.scale }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ inputs.story }}
+          path: out/*.mp4
